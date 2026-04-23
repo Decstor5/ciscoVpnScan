@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""cisco_vpn_scan.py 
- Cisco SSL VPN / AnyConnect / ASA detection scanner (v2.0).
+"""
+cisco_vpn_scan.py — Cisco SSL VPN / AnyConnect / ASA detection scanner (v2.0).
+
 Template-driven, detection-only. Inspired by the nuclei template model:
 CVE checks live in YAML files under ./templates/ so new detections can be
 added without touching this file. Three template types are supported:
-  * type: http        
- send a safe GET and evaluate matchers
-  * type: version     
- compare parsed version against per-train boundaries
-  * type: fingerprint 
- flag when a specific fingerprint was observed
+
+  * type: http        — send a safe GET and evaluate matchers
+  * type: version     — compare parsed version against per-train boundaries
+  * type: fingerprint — flag when a specific fingerprint was observed
+
 All probes are read-only. No exploit code, no destructive requests.
-FOR AUTHORIZED SECURITY TESTING ONLY."""
+
+FOR AUTHORIZED SECURITY TESTING ONLY.
+"""
+
 from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -27,40 +31,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
 try:
     import aiohttp
     from aiohttp import ClientTimeout, TCPConnector
 except ImportError:  # pragma: no cover
     sys.stderr.write("[-] aiohttp is required. pip install -r requirements.txt\n")
     sys.exit(1)
+
 try:
     import yaml
 except ImportError:  # pragma: no cover
     sys.stderr.write("[-] PyYAML is required. pip install -r requirements.txt\n")
     sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Banner
 # ---------------------------------------------------------------------------
+
 BANNER = r"""
- ___________________
- | _______________ |
- | |      In progress      | |
- | |______________| |
- | |  Cisco SSL VPN   |
- | | AnyConnect        || |
- | |                                     | |
- | |                                     | |
- |_______________ |
-     _[_______]_
- ___[___________]___
-|         [_____] []|__
-|         [_____] []|  \__
-L___________________J     \ \___\/
- ___ex5loid________________      /\
-/###################\    (__)
+ ______ __                    _______
+|      |__|.-----.----.-----.|     __|.----.---.-.-----.
+|   ---|  ||__ --|  __|  _  ||__     ||  __|  _  |     |
+|______|__||_____|____|_____||_______||____|___._|__|__|
+
+       Cisco SSL VPN / AnyConnect / ASA Detection Scanner
+            v2.0  --  template-driven, detection-only
+                     Design by ex5loid
+"""
+
+
 # ---------------------------------------------------------------------------
 # Fingerprinting: paths, headers, signatures
 # ---------------------------------------------------------------------------
+
 # Paths probed during fingerprinting. Purely passive GETs.
 PORTAL_PATHS: List[str] = [
     "/",
@@ -72,10 +77,10 @@ PORTAL_PATHS: List[str] = [
     "/+webvpn+/index.html",
     "/CSCOSSLC/config-auth",
 ]
- 
+
 # Paths used to detect Cisco IOS XE Web UI (for CVE-2023-20198 context).
 IOSXE_WEBUI_PATHS: List[str] = ["/webui/", "/webui/login.html"]
- 
+
 # Headers we surface in the output. X-Transcend-Version is a Pulse Secure /
 # Ivanti signal, not Cisco — we capture it only to help analysts distinguish
 # mixed SSL-VPN fleets.
@@ -83,7 +88,7 @@ INTERESTING_HEADERS: List[str] = [
     "Server", "Set-Cookie", "X-Powered-By", "X-Transcend-Version",
     "WWW-Authenticate", "X-AppWeb-Version", "Via", "X-Cisco-ASA-Custom",
 ]
- 
+
 # Heuristic signatures.
 SIGS: Dict[str, re.Pattern[str]] = {
     "anyconnect_html": re.compile(
@@ -124,16 +129,16 @@ SIGS: Dict[str, re.Pattern[str]] = {
         r'<version\s+who="sg">([^<]+)</version>', re.I,
     ),
 }
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
- 
+
 @dataclass
 class Finding:
     """Schema per the spec: cve, name, evidence, confidence.
- 
+
     severity and reference are supplementary metadata (inherent to the CVE,
     not remediation advice) and are included for analyst context.
     """
@@ -143,8 +148,8 @@ class Finding:
     confidence: str              # "low" | "medium" | "high"
     severity: str = "unknown"
     reference: str = ""
- 
- 
+
+
 @dataclass
 class ScanResult:
     target: str
@@ -162,21 +167,21 @@ class ScanResult:
     vulnerabilities: List[Finding] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     scanned_at: str = ""
- 
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["vulnerabilities"] = [asdict(f) for f in self.vulnerabilities]
         return d
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
- 
+
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
- 
- 
+
+
 def normalize_target(raw: str) -> Tuple[str, str, int]:
     """Accept 'host', 'host:port', or a full URL; return (url, host, port)."""
     raw = raw.strip()
@@ -191,14 +196,14 @@ def normalize_target(raw: str) -> Tuple[str, str, int]:
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     scheme = parsed.scheme or "https"
     return f"{scheme}://{host}:{port}", host, port
- 
- 
+
+
 def version_tuple(v: str) -> Tuple[int, ...]:
     """'9.8.2.14' -> (9, 8, 2, 14)."""
     parts = re.split(r"[^\d]+", v.strip())
     return tuple(int(p) for p in parts if p.isdigit())
- 
- 
+
+
 def version_le(a: str, b: str) -> bool:
     """Segment-wise <= comparison, zero-padded to equal length."""
     ta, tb = version_tuple(a), version_tuple(b)
@@ -206,12 +211,12 @@ def version_le(a: str, b: str) -> bool:
     ta = ta + (0,) * (length - len(ta))
     tb = tb + (0,) * (length - len(tb))
     return ta <= tb
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # TLS certificate (out-of-band, blocking, run in executor)
 # ---------------------------------------------------------------------------
- 
+
 def _fetch_certificate_sync(host: str, port: int, timeout: float) -> Dict[str, Any]:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -234,8 +239,8 @@ def _fetch_certificate_sync(host: str, port: int, timeout: float) -> Dict[str, A
         "tls_version": tls_version,
         "cipher": cipher[0] if cipher else None,
     }
- 
- 
+
+
 async def fetch_certificate(host: str, port: int, timeout: float) -> Dict[str, Any]:
     loop = asyncio.get_running_loop()
     try:
@@ -244,15 +249,15 @@ async def fetch_certificate(host: str, port: int, timeout: float) -> Dict[str, A
         )
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Template loader + matcher engine
 # ---------------------------------------------------------------------------
- 
+
 class Template:
     """In-memory representation of a detection template (YAML file)."""
- 
+
     def __init__(self, data: Dict[str, Any], path: Optional[str] = None) -> None:
         self.raw = data
         self.path = path
@@ -267,14 +272,14 @@ class Template:
         self.requests: List[Dict[str, Any]] = data.get("requests", [])
         self.affected_at_or_below: List[str] = data.get("affected_at_or_below", [])
         self.evidence_template: str = data.get("evidence_template", "")
- 
+
     def applies(self, result: ScanResult) -> bool:
         """Scope filter: should we run this template for this target?"""
         if not self.applies_to:
             return True
         return result.service in self.applies_to or "unknown" in self.applies_to
- 
- 
+
+
 def load_templates(directory: str) -> List[Template]:
     """Load every *.yaml / *.yml under directory."""
     templates: List[Template] = []
@@ -289,12 +294,12 @@ def load_templates(directory: str) -> List[Template]:
         except Exception as exc:
             sys.stderr.write(f"[!] failed to load template {path}: {exc}\n")
     return templates
- 
- 
+
+
 def _get_header_blob(headers: Dict[str, str]) -> str:
     return "\n".join(f"{k}: {v}" for k, v in headers.items())
- 
- 
+
+
 def evaluate_matcher(
     matcher: Dict[str, Any],
     status: int,
@@ -303,18 +308,18 @@ def evaluate_matcher(
 ) -> Tuple[bool, List[str]]:
     """Return (pass, hits) where `hits` is the list of matched tokens/patterns."""
     mtype = matcher.get("type")
- 
+
     if mtype == "status":
         wanted = matcher.get("values", [])
         return status in wanted, [str(status)] if status in wanted else []
- 
+
     if mtype in ("word", "regex"):
         part = matcher.get("part", "body")
         haystack = body if part == "body" else _get_header_blob(headers)
         case_insensitive = matcher.get("case_insensitive", True)
         hay_cmp = haystack.lower() if case_insensitive else haystack
         hits: List[str] = []
- 
+
         if mtype == "word":
             words = matcher.get("words", [])
             for w in words:
@@ -329,7 +334,7 @@ def evaluate_matcher(
                 return len(hits) >= min_count, hits
             # default: or
             return len(hits) > 0, hits
- 
+
         # regex
         patterns = matcher.get("patterns", [])
         flags = re.I if case_insensitive else 0
@@ -341,7 +346,7 @@ def evaluate_matcher(
         if condition == "and":
             return len(hits) == len(patterns), hits
         return len(hits) > 0, hits
- 
+
     if mtype == "header":
         name = matcher.get("name", "")
         values = matcher.get("values", [])
@@ -352,10 +357,10 @@ def evaluate_matcher(
             if v.lower() in got.lower():
                 return True, [v]
         return False, []
- 
+
     return False, []
- 
- 
+
+
 def evaluate_matchers(
     matchers: List[Dict[str, Any]],
     condition: str,
@@ -373,15 +378,15 @@ def evaluate_matchers(
     if condition == "or":
         return any(results), all_hits
     return all(results), all_hits
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Scanner
 # ---------------------------------------------------------------------------
- 
+
 class CiscoVPNScanner:
     """Template-driven, detection-only Cisco SSL VPN scanner."""
- 
+
     def __init__(
         self,
         templates: List[Template],
@@ -399,9 +404,9 @@ class CiscoVPNScanner:
             "Mozilla/5.0 (compatible; CiscoVPNScan/2.0; detection-only)"
         )
         self._semaphore = asyncio.Semaphore(concurrency)
- 
+
     # -- session & fetch -----------------------------------------------------
- 
+
     def _make_session(self) -> aiohttp.ClientSession:
         connector = TCPConnector(ssl=False, limit=0)
         timeout = ClientTimeout(total=self.timeout)
@@ -409,7 +414,7 @@ class CiscoVPNScanner:
         return aiohttp.ClientSession(
             connector=connector, timeout=timeout, headers=headers,
         )
- 
+
     async def _fetch(
         self,
         session: aiohttp.ClientSession,
@@ -427,13 +432,13 @@ class CiscoVPNScanner:
                 return resp.status, headers, body
         except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
             return None
- 
+
     # -- top-level scan ------------------------------------------------------
- 
+
     async def scan(self, target_raw: str) -> ScanResult:
         async with self._semaphore:
             return await self._scan_inner(target_raw)
- 
+
     async def _scan_inner(self, target_raw: str) -> ScanResult:
         try:
             url, host, port = normalize_target(target_raw)
@@ -441,16 +446,16 @@ class CiscoVPNScanner:
             r = ScanResult(target=target_raw, url="", scanned_at=_now_iso())
             r.errors.append(f"invalid target: {exc}")
             return r
- 
+
         result = ScanResult(target=target_raw, url=url, scanned_at=_now_iso())
         result.certificate = await fetch_certificate(host, port, self.timeout)
- 
+
         async with self._make_session() as session:
             await self._fingerprint(session, url, result)
- 
+
             if not result.reachable:
                 return result
- 
+
             for tmpl in self.templates:
                 if not tmpl.applies(result):
                     continue
@@ -460,11 +465,11 @@ class CiscoVPNScanner:
                     result.errors.append(
                         f"template {tmpl.id} failed: {type(exc).__name__}: {exc}"
                     )
- 
+
         return result
- 
+
     # -- fingerprinting ------------------------------------------------------
- 
+
     async def _fingerprint(
         self,
         session: aiohttp.ClientSession,
@@ -478,18 +483,18 @@ class CiscoVPNScanner:
                 continue
             status, headers, body = resp
             result.reachable = True
- 
+
             # Capture interesting headers once.
             for h in INTERESTING_HEADERS:
                 if h not in result.headers:
                     v = headers.get(h) or headers.get(h.lower())
                     if v:
                         result.headers[h] = v
- 
+
             server = headers.get("Server", "") or headers.get("server", "")
             if result.banner is None and server:
                 result.banner = server
- 
+
             # --- ASA / WebVPN signals --------------------------------------
             if SIGS["asa_server_header"].search(server):
                 result.is_cisco_vpn = True
@@ -498,7 +503,7 @@ class CiscoVPNScanner:
                 fp = f"server-header:{server}"
                 if fp not in result.fingerprints:
                     result.fingerprints.append(fp)
- 
+
             set_cookie = (
                 headers.get("Set-Cookie", "") + headers.get("set-cookie", "")
             )
@@ -509,7 +514,7 @@ class CiscoVPNScanner:
                 fp = "cookie:webvpn"
                 if fp not in result.fingerprints:
                     result.fingerprints.append(fp)
- 
+
             if SIGS["anyconnect_html"].search(body):
                 result.is_cisco_vpn = True
                 if result.service == "unknown":
@@ -517,13 +522,13 @@ class CiscoVPNScanner:
                 fp = f"html-sig:{path}"
                 if fp not in result.fingerprints:
                     result.fingerprints.append(fp)
- 
+
             if SIGS["logon_form"].search(body):
                 result.login_portal = True
                 fp = f"logon-form:{path}"
                 if fp not in result.fingerprints:
                     result.fingerprints.append(fp)
- 
+
             # --- IOS XE Web UI signal -------------------------------------
             if SIGS["iosxe_webui"].search(body) or SIGS["iosxe_webui"].search(server):
                 result.is_cisco_vpn = True
@@ -533,19 +538,19 @@ class CiscoVPNScanner:
                 fp = f"iosxe-webui:{path}"
                 if fp not in result.fingerprints:
                     result.fingerprints.append(fp)
- 
+
             # --- version extraction ---------------------------------------
             if not result.version:
                 v, src = self._extract_version(body, headers)
                 if v:
                     result.version = v
                     result.version_source = src
- 
+
         # AnyConnect-проба: более надёжный способ идентификации ASA.
         # Отправляем один GET с заголовком X-Aggregate-Auth: 1 — ASA
         # отвечает XML-документом с config-auth и точной версией.
         await self._probe_anyconnect_header(session, base_url, result)
- 
+
         # Certificate-based fallback for Cisco identification.
         cert_blob = json.dumps(result.certificate or {}, default=str)
         if not result.is_cisco_vpn and re.search(
@@ -555,7 +560,7 @@ class CiscoVPNScanner:
             if result.service == "unknown":
                 result.service = "cisco-asa-webvpn"
             result.fingerprints.append("cert:cisco-keyword")
- 
+
     @staticmethod
     def _extract_version(
         body: str, headers: Dict[str, str],
@@ -570,7 +575,7 @@ class CiscoVPNScanner:
             m = SIGS[key].search(body)
             if m:
                 return m.group(1), source
- 
+
         # Header-side fallback.
         header_blob = _get_header_blob(headers)
         for key, source in (
@@ -581,15 +586,15 @@ class CiscoVPNScanner:
             m = SIGS[key].search(header_blob)
             if m:
                 return m.group(1), source
- 
+
         # Last-resort generic pattern in body.
         m = SIGS["version_generic"].search(body)
         if m:
             return m.group(1), "html:generic"
         return None, None
- 
+
     # -- anyconnect probe ----------------------------------------------------
- 
+
     async def _probe_anyconnect_header(
         self,
         session: aiohttp.ClientSession,
@@ -597,17 +602,17 @@ class CiscoVPNScanner:
         result: ScanResult,
     ) -> None:
         """Более надёжный детект ASA: GET / с заголовком X-Aggregate-Auth.
- 
+
         Техника позаимствована из проекта projectdiscovery/nuclei-templates
         (cisco-asa-detect.yaml, автор: sdcampbell). ASA отвечает на такой
         запрос XML-документом вида:
- 
+
             <?xml version="1.0" encoding="UTF-8"?>
             <config-auth client="vpn" type="hello" aggregate-auth-version="2">
               <version who="sg">9.18.3</version>
               ...
             </config-auth>
- 
+
         Это даёт и точный отпечаток ASA, и версию в явном виде, без
         необходимости парсить HTML.
         """
@@ -624,7 +629,7 @@ class CiscoVPNScanner:
                 body = await resp.text(errors="replace")
         except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
             return
- 
+
         if SIGS["asa_config_auth"].search(body):
             result.is_cisco_vpn = True
             if result.service == "unknown":
@@ -632,7 +637,7 @@ class CiscoVPNScanner:
             fp = "anyconnect-probe:config-auth"
             if fp not in result.fingerprints:
                 result.fingerprints.append(fp)
- 
+
         # Явная версия из XML — перетирает менее точные источники.
         m = SIGS["asa_version_xml"].search(body)
         if m:
@@ -641,9 +646,9 @@ class CiscoVPNScanner:
                             result.version_source != "xml:anyconnect-probe"):
                 result.version = version
                 result.version_source = "xml:anyconnect-probe"
- 
+
     # -- template dispatch ---------------------------------------------------
- 
+
     async def _run_template(
         self,
         session: aiohttp.ClientSession,
@@ -658,7 +663,7 @@ class CiscoVPNScanner:
         elif tmpl.type == "http":
             await self._run_http_template(session, base_url, tmpl, result)
         # Unknown types are silently skipped (forward-compat).
- 
+
     def _run_version_template(self, tmpl: Template, result: ScanResult) -> None:
         if not result.version or not tmpl.affected_at_or_below:
             return
@@ -681,7 +686,7 @@ class CiscoVPNScanner:
                     reference=tmpl.reference,
                 ))
                 return
- 
+
     def _run_fingerprint_template(self, tmpl: Template, result: ScanResult) -> None:
         if not tmpl.require_fingerprint:
             return
@@ -701,7 +706,7 @@ class CiscoVPNScanner:
                 severity=tmpl.severity,
                 reference=tmpl.reference,
             ))
- 
+
     async def _run_http_template(
         self,
         session: aiohttp.ClientSession,
@@ -713,12 +718,12 @@ class CiscoVPNScanner:
             method = req.get("method", "GET").upper()
             path = req.get("path", "/")
             url = base_url + path
- 
+
             resp = await self._fetch(session, url, method=method)
             if resp is None:
                 continue
             status, headers, body = resp
- 
+
             condition = req.get("matchers_condition", "and")
             matchers = req.get("matchers", [])
             passed, hits = evaluate_matchers(
@@ -726,7 +731,7 @@ class CiscoVPNScanner:
             )
             if not passed:
                 continue
- 
+
             # Render evidence_template with captured hits / path / status.
             tmpl_str = req.get("evidence_template") or tmpl.evidence_template \
                 or "template {cve} matched at {path} (HTTP {status}); hits={hits}"
@@ -743,12 +748,12 @@ class CiscoVPNScanner:
                 reference=tmpl.reference,
             ))
             return  # one hit per template is enough
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Rendering (console)
 # ---------------------------------------------------------------------------
- 
+
 ANSI = {
     "reset": "\033[0m", "bold": "\033[1m",
     "red": "\033[31m", "green": "\033[32m",
@@ -766,23 +771,23 @@ CONF_COLOR = {
     "medium": ANSI["yellow"],
     "low":    ANSI["grey"],
 }
- 
- 
+
+
 def render_console(r: ScanResult, use_color: bool = True) -> str:
     def c(code: str) -> str:
         return ANSI[code] if use_color else ""
- 
+
     out: List[str] = []
     head_color = c("green") if r.is_cisco_vpn else c("grey")
     out.append(f"{head_color}{c('bold')}[*] {r.target}{c('reset')}  ->  {r.url}")
- 
+
     for e in r.errors:
         out.append(f"    {c('red')}[!] {e}{c('reset')}")
- 
+
     if not r.reachable:
         out.append(f"    {c('grey')}[-] unreachable / no HTTP(S) response{c('reset')}")
         return "\n".join(out)
- 
+
     tag = "Cisco SSL VPN detected" if r.is_cisco_vpn else "not identified as Cisco"
     out.append(f"    {c('cyan')}service :{c('reset')} {r.service}   ({tag})")
     if r.version:
@@ -797,7 +802,7 @@ def render_console(r: ScanResult, use_color: bool = True) -> str:
         out.append(f"    {c('cyan')}portal  :{c('reset')} login form present")
     if r.fingerprints:
         out.append(f"    {c('cyan')}fprints :{c('reset')} " + ", ".join(r.fingerprints))
- 
+
     cert = r.certificate or {}
     if cert and "error" not in cert:
         out.append(
@@ -806,11 +811,11 @@ def render_console(r: ScanResult, use_color: bool = True) -> str:
             f"issuer={cert.get('issuer', {}).get('commonName', '-')} "
             f"tls={cert.get('tls_version')}"
         )
- 
+
     if not r.vulnerabilities:
         out.append(f"    {c('green')}[+] no known-CVE indicators found{c('reset')}")
         return "\n".join(out)
- 
+
     out.append(f"    {c('bold')}vulnerabilities:{c('reset')}")
     for v in r.vulnerabilities:
         sev = SEV_COLOR.get(v.severity, "") if use_color else ""
@@ -824,12 +829,12 @@ def render_console(r: ScanResult, use_color: bool = True) -> str:
         if v.reference:
             out.append(f"          reference  : {v.reference}")
     return "\n".join(out)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
- 
+
 def load_targets(single: Optional[str], list_path: Optional[str]) -> List[str]:
     targets: List[str] = []
     if single:
@@ -847,25 +852,25 @@ def load_targets(single: Optional[str], list_path: Optional[str]) -> List[str]:
             out.append(t)
             seen.add(t)
     return out
- 
- 
+
+
 async def run(args: argparse.Namespace) -> int:
     targets = load_targets(args.target, args.list)
     if not targets:
         print("[-] no targets supplied (use -t or -l)", file=sys.stderr)
         return 2
- 
+
     templates_dir = args.templates or _default_templates_dir()
     templates = load_templates(templates_dir)
     if not templates:
         print(f"[!] no templates loaded from {templates_dir}", file=sys.stderr)
- 
+
     if not args.no_banner:
         print(BANNER)
     print(f"[*] loaded {len(templates)} template(s) from {templates_dir}")
     print(f"[*] scanning {len(targets)} target(s), "
           f"concurrency={args.concurrency}, timeout={args.timeout}s")
- 
+
     scanner = CiscoVPNScanner(
         templates=templates,
         timeout=args.timeout,
@@ -874,7 +879,7 @@ async def run(args: argparse.Namespace) -> int:
         user_agent=args.user_agent,
         concurrency=args.concurrency,
     )
- 
+
     start = time.monotonic()
     tasks = [scanner.scan(t) for t in targets]
     results: List[ScanResult] = []
@@ -882,10 +887,10 @@ async def run(args: argparse.Namespace) -> int:
         r = await coro
         results.append(r)
         print(render_console(r, use_color=sys.stdout.isatty() and not args.no_color))
- 
+
     elapsed = time.monotonic() - start
     print(f"\n[*] scanned {len(results)} target(s) in {elapsed:.1f}s")
- 
+
     if args.json:
         report = {
             "scanner": "cisco_vpn_scan",
@@ -897,15 +902,15 @@ async def run(args: argparse.Namespace) -> int:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, default=str)
         print(f"[*] JSON report written to {args.json}")
- 
+
     return 0
- 
- 
+
+
 def _default_templates_dir() -> str:
     here = Path(__file__).resolve().parent
     return str(here / "templates")
- 
- 
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="cisco_vpn_scan",
@@ -930,8 +935,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     p.add_argument("--no-banner", action="store_true", help="suppress startup banner")
     return p
- 
- 
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -941,7 +946,7 @@ def main() -> None:
         print("\n[!] interrupted", file=sys.stderr)
         rc = 130
     sys.exit(rc)
- 
- 
+
+
 if __name__ == "__main__":
     main()
