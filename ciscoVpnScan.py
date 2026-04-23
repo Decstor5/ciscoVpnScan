@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-cisco_vpn_scan.py 
+"""cisco_vpn_scan.py 
  Cisco SSL VPN / AnyConnect / ASA detection scanner (v2.0).
 Template-driven, detection-only. Inspired by the nuclei template model:
 CVE checks live in YAML files under ./templates/ so new detections can be
@@ -11,7 +11,7 @@ added without touching this file. Three template types are supported:
   * type: fingerprint 
  flag when a specific fingerprint was observed
 All probes are read-only. No exploit code, no destructive requests.
-FOR AUTHORIZED SECURITY TESTING ONLY.
+FOR AUTHORIZED SECURITY TESTING ONLY."""
 from __future__ import annotations
 import argparse
 import asyncio
